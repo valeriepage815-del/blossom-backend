@@ -20,7 +20,72 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const multer = require('multer');
 const cors = require('cors');
 
+
 app.use(cors());
+
+// Stripe webhook FIRST – uses raw body
+app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed.', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object;
+        console.log('Invoice paid:', invoice.id);
+
+        // ...existing file/subscription updates...
+
+        // auth0 tier sync
+        try {
+          const email =
+            invoice.customer_email || invoice.customer_details?.email;
+          const tier = getTierFromInvoice(invoice);
+          if (!email) {
+            console.warn('[auth0-sync] No customer_email on invoice');
+          } else if (!tier) {
+            console.warn('[auth0-sync] No tier metadata on invoice/price');
+          } else {
+            console.log(`[auth0-sync] Setting tier="${tier}" for email=${email}`);
+            await updateAuth0TierByEmail(email, tier);
+          }
+        } catch (err) {
+          console.error('[auth0-sync] Error syncing tier to Auth0:', err);
+        }
+
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        console.log('Invoice payment failed:', invoice.id);
+        // ...existing status update code...
+        break;
+      }
+
+      // You can keep other cases like customer.subscription.created if you added them
+      default:
+        console.log('Unhandled event type:', event.type);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+    res.status(500).send('Webhook handler error');
+  }
+});
+
+// All other JSON routes *after* the webhook
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -456,3 +521,8 @@ async function updateAuth0TierByEmail(email, tier) {
     console.error('Error updating Auth0 tier:', err);
   }
 }
+
+// Basic Express server template
+app.get('/', (req, res) => {
+  res.send('Blossom backend is running!');
+});
