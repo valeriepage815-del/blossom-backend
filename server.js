@@ -3,112 +3,217 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const Stripe = require('stripe');
+// (Consolidated server - /api endpoints are added below)
+require('dotenv').config();
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const Stripe = require('stripe');
 const fs = require('fs');
 const path = require('path');
 const { ManagementClient } = require('auth0');
+const multer = require('multer');
+const cors = require('cors');
 
 const app = express();
+
 // ---- Auth0 Management (M2M app) ----
 const auth0Mgmt = new ManagementClient({
   domain: process.env.AUTH0_DOMAIN,
   clientId: process.env.AUTH0_M2M_CLIENT_ID,
   clientSecret: process.env.AUTH0_M2M_CLIENT_SECRET,
   audience: process.env.AUTH0_MANAGEMENT_API_AUDIENCE,
-  scope: 'read:users update:users_app_metadata'
+  scope: 'read:users update:users_app_metadata',
 });
+
+// ---- Stripe ----
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const multer = require('multer');
-const cors = require('cors');
 
-
+// CORS for frontend
 app.use(cors());
 
-// Stripe webhook FIRST – uses raw body
-app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error('Webhook signature verification failed.', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+/* ------------------------------------------------------------------
+   Stripe Webhook (MUST be before express.json)
+-------------------------------------------------------------------*/
+app.post(
+  '/webhook',
+  bodyParser.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
 
-  try {
-    switch (event.type) {
-      case 'invoice.payment_succeeded': {
-        const invoice = event.data.object;
-        console.log('Invoice paid:', invoice.id);
-
-        // ...existing file/subscription updates...
-
-        // auth0 tier sync
-        try {
-          const email =
-            invoice.customer_email || invoice.customer_details?.email;
-          const tier = getTierFromInvoice(invoice);
-          if (!email) {
-            console.warn('[auth0-sync] No customer_email on invoice');
-          } else if (!tier) {
-            console.warn('[auth0-sync] No tier metadata on invoice/price');
-          } else {
-            console.log(`[auth0-sync] Setting tier="${tier}" for email=${email}`);
-            await updateAuth0TierByEmail(email, tier);
-          }
-        } catch (err) {
-          console.error('[auth0-sync] Error syncing tier to Auth0:', err);
-        }
-
-        break;
-      }
-
-      case 'invoice.payment_failed': {
-        const invoice = event.data.object;
-        console.log('Invoice payment failed:', invoice.id);
-        // ...existing status update code...
-        break;
-      }
-
-      // You can keep other cases like customer.subscription.created if you added them
-      default:
-        console.log('Unhandled event type:', event.type);
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('Webhook signature verification failed.', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    res.json({ received: true });
-  } catch (err) {
-    console.error('Webhook handler error:', err);
-    res.status(500).send('Webhook handler error');
-  }
-});
+    try {
+      switch (event.type) {
+        case 'invoice.payment_succeeded': {
+          const invoice = event.data.object;
+          console.log('Invoice paid:', invoice.id);
 
-// All other JSON routes *after* the webhook
+          // Update local subscriptions.json status
+          try {
+            const outPath = path.join(__dirname, 'public', 'data');
+            const subsFile = path.join(outPath, 'subscriptions.json');
+            if (fs.existsSync(subsFile)) {
+              const subs =
+                JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}') || {};
+              const subId =
+                invoice.subscription ||
+                invoice.lines?.data?.[0]?.subscription;
+
+              if (subId && subs[subId]) {
+                subs[subId].status = 'active';
+                subs[subId].lastInvoice = invoice.id;
+                fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
+              }
+            }
+          } catch (err) {
+            console.error('Failed to update subscription status', err);
+          }
+
+          // Sync Auth0 tier based on invoice metadata
+          try {
+            const email =
+              invoice.customer_email || invoice.customer_details?.email;
+            const tier = getTierFromInvoice(invoice);
+
+            if (!email) {
+              console.warn(
+                '[auth0-sync] No customer_email on invoice; cannot sync tier.'
+              );
+            } else if (!tier) {
+              console.warn(
+                '[auth0-sync] No tier metadata on invoice/line/price; cannot sync tier.'
+              );
+            } else {
+              console.log(
+                `[auth0-sync] Setting tier="${tier}" for email=${email}`
+              );
+              await updateAuth0TierByEmail(email, tier);
+            }
+          } catch (err) {
+            console.error('[auth0-sync] Error syncing tier to Auth0:', err);
+          }
+
+          break;
+        }
+
+        case 'invoice.payment_failed': {
+          const invoice = event.data.object;
+          console.log('Invoice payment failed:', invoice.id);
+
+          // Mark subscription as past_due locally
+          try {
+            const outPath = path.join(__dirname, 'public', 'data');
+            const subsFile = path.join(outPath, 'subscriptions.json');
+            if (fs.existsSync(subsFile)) {
+              const subs =
+                JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}') || {};
+              const subId =
+                invoice.subscription ||
+                invoice.lines?.data?.[0]?.subscription;
+
+              if (subId && subs[subId]) {
+                subs[subId].status = 'past_due';
+                fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
+              }
+            }
+          } catch (err) {
+            console.error('Failed to update subscription status', err);
+          }
+
+          break;
+        }
+
+        case 'customer.subscription.created': {
+          const sub = event.data.object;
+          console.log('Subscription created:', sub.id);
+
+          // Create/update entry in subscriptions.json
+          try {
+            const outPath = path.join(__dirname, 'public', 'data');
+            if (!fs.existsSync(outPath)) {
+              fs.mkdirSync(outPath, { recursive: true });
+            }
+            const subsFile = path.join(outPath, 'subscriptions.json');
+            let subs = {};
+            if (fs.existsSync(subsFile)) {
+              subs =
+                JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}') || {};
+            }
+
+            const sid = sub.id;
+            subs[sid] = subs[sid] || {
+              id: sid,
+              email: sub.customer_email || '',
+              created: new Date().toISOString(),
+            };
+            subs[sid].status = sub.status || subs[sid].status || 'created';
+
+            fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
+          } catch (err) {
+            console.error('Failed to update subscription file', err);
+          }
+
+          break;
+        }
+
+        default:
+          console.log('Unhandled event type:', event.type);
+      }
+
+      res.json({ received: true });
+    } catch (err) {
+      console.error('Webhook handler error:', err);
+      res.status(500).send('Webhook handler error');
+    }
+  }
+);
+
+/* ------------------------------------------------------------------
+   All other middleware/routes AFTER webhook
+-------------------------------------------------------------------*/
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Serve uploaded images
 app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
-// Multer setup
+/* ------------------------------------------------------------------
+   Multer setup for image uploads
+-------------------------------------------------------------------*/
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     cb(null, path.join(__dirname, 'public', 'uploads'));
   },
   filename: function (req, file, cb) {
     const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const safe = file.originalname.replace(/[^a-zA-Z0-9.\-\_]/g, '_');
+    const safe = file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_');
     cb(null, unique + '-' + safe);
-  }
+  },
 });
 const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
 
+/* ------------------------------------------------------------------
+   Image Upload Endpoints
+-------------------------------------------------------------------*/
 // Image upload endpoint
 app.post('/upload-image', upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+  const publicUrl = `${req.protocol}://${req.get('host')}/uploads/${
+    req.file.filename
+  }`;
+
   // persist metadata
   try {
     const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
@@ -116,11 +221,16 @@ app.post('/upload-image', upload.single('image'), (req, res) => {
     if (fs.existsSync(metaPath)) {
       meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
     }
-    meta.push({ filename: req.file.filename, url: publicUrl, uploadedAt: new Date().toISOString() });
+    meta.push({
+      filename: req.file.filename,
+      url: publicUrl,
+      uploadedAt: new Date().toISOString(),
+    });
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   } catch (err) {
     console.error('Failed to write metadata', err);
   }
+
   res.json({ url: publicUrl, filename: req.file.filename });
 });
 
@@ -142,18 +252,24 @@ app.delete('/admin/uploads/:filename', (req, res) => {
     const filename = req.params.filename;
     const filePath = path.join(__dirname, 'public', 'uploads', filename);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
     const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
     let meta = [];
-    if (fs.existsSync(metaPath)) meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
-    meta = meta.filter(m => m.filename !== filename);
+    if (fs.existsSync(metaPath)) {
+      meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
+    }
+    meta = meta.filter((m) => m.filename !== filename);
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
     res.json({ deleted: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Admin: save powergrid JSON (for resume dashboard resources)
+/* ------------------------------------------------------------------
+   Admin: save powergrid JSON (for resume dashboard resources)
+-------------------------------------------------------------------*/
 app.post('/admin/powergrid', requireAdmin, (req, res) => {
   try {
     const body = req.body;
@@ -167,7 +283,9 @@ app.post('/admin/powergrid', requireAdmin, (req, res) => {
   }
 });
 
-// Create a subscription and return the client secret for the Payment Element
+/* ------------------------------------------------------------------
+   Create a subscription (Payment Element flow)
+-------------------------------------------------------------------*/
 app.post('/create-subscription', async (req, res) => {
   const { priceId, email } = req.body;
   if (!priceId) return res.status(400).json({ error: 'Missing priceId' });
@@ -186,128 +304,42 @@ app.post('/create-subscription', async (req, res) => {
 
     const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
 
-    // persist a lightweight subscriptions JSON for the demo so the Flask app can verify
+    // Persist a lightweight subscriptions JSON
     try {
       const outPath = path.join(__dirname, 'public', 'data');
       if (!fs.existsSync(outPath)) fs.mkdirSync(outPath, { recursive: true });
       const subsFile = path.join(outPath, 'subscriptions.json');
       let subs = {};
-      if (fs.existsSync(subsFile)) subs = JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}');
-      subs[subscription.id] = { id: subscription.id, email: email || '', status: subscription.status || 'incomplete', created: new Date().toISOString() };
+      if (fs.existsSync(subsFile)) {
+        subs = JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}') || {};
+      }
+
+      subs[subscription.id] = {
+        id: subscription.id,
+        email: email || '',
+        status: subscription.status || 'incomplete',
+        created: new Date().toISOString(),
+      };
+
       fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
     } catch (err) {
       console.error('Failed to write subscriptions file', err);
     }
 
-    res.json({ clientSecret, subscriptionId: subscription.id, publishableKey: process.env.STRIPE_PUBLISHABLE_KEY });
+    res.json({
+      clientSecret,
+      subscriptionId: subscription.id,
+      publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+    });
   } catch (err) {
     console.error('Error creating subscription:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Webhook endpoint to listen for subscription and invoice events
-app.post('/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature verification failed.', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    switch (event.type) {
-      case 'invoice.payment_succeeded': {
-        const invoice = event.data.object;
-        console.log('Invoice paid:', invoice.id);
-
-        // existing file-based status update
-        try {
-          const outPath = path.join(__dirname, 'public', 'data');
-          const subsFile = path.join(outPath, 'subscriptions.json');
-          if (fs.existsSync(subsFile)) {
-            const subs = JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}');
-            const subId = invoice.subscription || invoice.lines?.data?.[0]?.subscription;
-            if (subId && subs[subId]) {
-              subs[subId].status = 'active';
-              subs[subId].lastInvoice = invoice.id;
-              fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
-            }
-          }
-        } catch (err) {
-          console.error('Failed to update subscription status', err);
-        }
-
-        // ---- NEW: sync Auth0 tier based on invoice ----
-        try {
-          const email = invoice.customer_email || invoice.customer_details?.email;
-          const tier = getTierFromInvoice(invoice);
-
-          if (!email) {
-            console.warn('[auth0-sync] No customer_email on invoice; cannot sync tier.');
-          } else if (!tier) {
-            console.warn('[auth0-sync] No tier metadata on invoice/line/price; cannot sync tier.');
-          } else {
-            console.log(`[auth0-sync] Setting tier="${tier}" for email=${email}`);
-            await updateAuth0TierByEmail(email, tier);
-          }
-        } catch (err) {
-          console.error('[auth0-sync] Error syncing tier to Auth0:', err);
-        }
-
-        break;
-      }
-      case 'invoice.payment_failed': {
-        const invoice = event.data.object;
-        console.log('Invoice payment failed:', invoice.id);
-        try {
-          const outPath = path.join(__dirname, 'public', 'data');
-          const subsFile = path.join(outPath, 'subscriptions.json');
-          if (fs.existsSync(subsFile)) {
-            const subs = JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}');
-            const subId = invoice.subscription || invoice.lines?.data?.[0]?.subscription;
-            if (subId && subs[subId]) {
-              subs[subId].status = 'past_due';
-              fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
-            }
-          }
-        } catch (err) {
-          console.error('Failed to update subscription status', err);
-        }
-        break;
-      }
-      case 'customer.subscription.created': {
-        const sub = event.data.object;
-        console.log('Subscription created:', sub.id);
-        try {
-          const outPath = path.join(__dirname, 'public', 'data');
-          const subsFile = path.join(outPath, 'subscriptions.json');
-          let subs = {};
-          if (fs.existsSync(subsFile)) subs = JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}');
-          const sid = sub.id;
-          subs[sid] = subs[sid] || { id: sid, email: sub.customer_email || '', created: new Date().toISOString() };
-          subs[sid].status = sub.status || subs[sid].status || 'created';
-          fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
-        } catch (err) {
-          console.error('Failed to update subscription file', err);
-        }
-        break;
-      }
-      default:
-        console.log('Unhandled event type:', event.type);
-    }
-
-    res.json({ received: true });
-  } catch (err) {
-    console.error('Webhook handler error:', err);
-    res.status(500).send('Webhook handler error');
-  }
-});
-
-const PORT = process.env.PORT || 4242;
-// DEBUG: View Auth0 tier for a user by email
+/* ------------------------------------------------------------------
+   Debug: View Auth0 tier for a user by email
+-------------------------------------------------------------------*/
 app.get('/debug/auth0-tier', async (req, res) => {
   const email = (req.query.email || '').trim();
   if (!email) {
@@ -317,7 +349,9 @@ app.get('/debug/auth0-tier', async (req, res) => {
   try {
     const users = await auth0Mgmt.getUsersByEmail(email);
     if (!users || users.length === 0) {
-      return res.status(404).json({ error: `No Auth0 user found for ${email}` });
+      return res
+        .status(404)
+        .json({ error: `No Auth0 user found for ${email}` });
     }
 
     const user = users[0];
@@ -333,34 +367,59 @@ app.get('/debug/auth0-tier', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-app.listen(PORT, () => console.log(`Stripe test server listening on http://localhost:${PORT}`));
 
-// --- Admin auth middleware ---
+/* ------------------------------------------------------------------
+   Admin auth middleware
+-------------------------------------------------------------------*/
 function requireAdmin(req, res, next) {
   const pw = process.env.ADMIN_PASSWORD || '';
-  if (!pw) return res.status(403).json({ error: 'Admin password not configured' });
+  if (!pw)
+    return res
+      .status(403)
+      .json({ error: 'Admin password not configured' });
+
   const header = req.headers['x-admin-password'];
   if (header && header === pw) return next();
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// AI rewrite endpoint (uses OpenAI API if OPENAI_API_KEY is set)
+/* ------------------------------------------------------------------
+   AI rewrite endpoint (OpenAI)
+-------------------------------------------------------------------*/
 app.post('/ai/rewrite', async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'OpenAI API key not configured' });
-  const { bullets, tone='concise' } = req.body;
-  if (!bullets || !Array.isArray(bullets)) return res.status(400).json({ error: 'Missing bullets array' });
+  if (!apiKey)
+    return res.status(500).json({ error: 'OpenAI API key not configured' });
+
+  const { bullets, tone = 'concise' } = req.body;
+  if (!bullets || !Array.isArray(bullets)) {
+    return res.status(400).json({ error: 'Missing bullets array' });
+  }
+
   try {
     const fetch = require('node-fetch');
-    const prompt = `Rewrite these resume bullets to be ${tone} and metrics-focused where possible:\n\n${bullets.map((b,i)=>`${i+1}. ${b}`).join('\n')}`;
+    const prompt = `Rewrite these resume bullets to be ${tone} and metrics-focused where possible:\n\n${bullets
+      .map((b, i) => `${i + 1}. ${b}`)
+      .join('\n')}`;
     const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({ model: 'gpt-4o-mini', messages:[{ role:'user', content: prompt }], max_tokens: 600 })
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 600,
+      }),
     });
     const j = await resp.json();
-    const text = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
-    // Split by lines and return
-    const out = text.split(/\n+/).map(s=>s.trim()).filter(Boolean);
+    const text =
+      j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
+    const out = text
+      .split(/\n+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
     res.json({ rewritten: out, raw: text });
   } catch (err) {
     console.error('AI rewrite error', err);
@@ -368,10 +427,11 @@ app.post('/ai/rewrite', async (req, res) => {
   }
 });
 
-// Simple bullets endpoint for the AI Bullet Coach (local fallback)
-function craftBulletsLocalServer(answers = {}, opts = {}){
+/* ------------------------------------------------------------------
+   Local Bullet Crafting Endpoint
+-------------------------------------------------------------------*/
+function craftBulletsLocalServer(answers = {}, opts = {}) {
   const tone = opts.tone || 'concise';
-  const chkRevenue = !!opts.emphasis?.revenue;
   const chkCompliance = !!opts.emphasis?.compliance;
   const chkSafety = !!opts.emphasis?.safety;
   const chkLeadership = !!opts.emphasis?.leadership;
@@ -384,24 +444,43 @@ function craftBulletsLocalServer(answers = {}, opts = {}){
     tools: answers.tools || '',
     metrics: answers.metrics || '',
     compliance: answers.compliance || '',
-    safety: answers.safety || ''
+    safety: answers.safety || '',
   };
 
-  const verbs = chkLeadership ? ['led','orchestrated','directed'] : ['implemented','streamlined','optimized'];
+  const verbs = chkLeadership
+    ? ['led', 'orchestrated', 'directed']
+    : ['implemented', 'streamlined', 'optimized'];
+
   const closers = [];
-  if (bits.metrics) closers.push(bits.metrics.replace(/^[-]\s*/, ''));
+  if (bits.metrics) closers.push(bits.metrics.replace(/^[-–—]\s*/, ''));
   if (chkCompliance && bits.compliance) closers.push(bits.compliance);
   if (chkSafety && bits.safety) closers.push(bits.safety);
   const closeStr = closers.length ? `; ${closers.join('; ')}` : '';
 
-  const tonePrefix = tone === 'impact' ? 'Delivered measurable results: ' : tone === 'compliance' ? 'Ensured regulatory readiness: ' : tone === 'patient' ? 'Elevated patient safety: ' : tone === 'leadership' ? 'Provided cross-functional leadership: ' : '';
-  const scopeStr = bits.scope ? (` (${bits.scope})`) : '';
+  const tonePrefix =
+    tone === 'impact'
+      ? 'Delivered measurable results: '
+      : tone === 'compliance'
+      ? 'Ensured regulatory readiness: '
+      : tone === 'patient'
+      ? 'Elevated patient safety: '
+      : tone === 'leadership'
+      ? 'Provided cross-functional leadership: '
+      : '';
+
+  const scopeStr = bits.scope ? ` (${bits.scope})` : '';
   const toolsStr = bits.tools ? ` using ${bits.tools}` : '';
   const probStr = bits.problem ? ` to address ${bits.problem}` : '';
+
   const base = `${tonePrefix}${verbs[0]} ${bits.actions}${toolsStr}${probStr}${scopeStr}${closeStr}`;
-  const alt1 = `${verbs[1]} ${bits.actions}${probStr}; leveraged ${bits.tools || 'key tools'}${scopeStr}${closeStr}`;
+  const alt1 = `${verbs[1]} ${bits.actions}${probStr}; leveraged ${
+    bits.tools || 'key tools'
+  }${scopeStr}${closeStr}`;
   const alt2 = `${verbs[2]} workflows${toolsStr}${probStr}${scopeStr}${closeStr}`;
-  return [base, alt1, alt2].filter(Boolean).map(s => s.trim());
+
+  return [base, alt1, alt2]
+    .filter(Boolean)
+    .map((s) => s.trim());
 }
 
 app.post('/api/bullets', (req, res) => {
@@ -415,36 +494,45 @@ app.post('/api/bullets', (req, res) => {
   }
 });
 
-// Export HTML of the resume (simple)
+/* ------------------------------------------------------------------
+   Export HTML / DOCX
+-------------------------------------------------------------------*/
 app.post('/export/html', (req, res) => {
-  const { title='Resume', html } = req.body;
+  const { title = 'Resume', html } = req.body;
   if (!html) return res.status(400).json({ error: 'Missing html' });
+
   const doc = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><link rel="stylesheet" href="/../style.css"></head><body>${html}</body></html>`;
   res.setHeader('Content-Disposition', 'attachment; filename="resume.html"');
   res.setHeader('Content-Type', 'text/html');
   res.send(doc);
 });
 
-// Export DOCX
 app.post('/export/docx', (req, res) => {
-  const { title='Resume', html } = req.body;
+  const { title = 'Resume', html } = req.body;
   if (!html) return res.status(400).json({ error: 'Missing html' });
+
   try {
     const htmlDocx = require('html-docx-js');
-    const docx = htmlDocx.asBlob(`<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${html}</body></html>`);
-    res.setHeader('Content-Disposition', 'attachment; filename="resume.docx"');
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    const docx = htmlDocx.asBlob(
+      `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${html}</body></html>`
+    );
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="resume.docx"'
+    );
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    );
     res.send(Buffer.from(docx));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Protect admin listing and deletion with requireAdmin middleware
 /* ------------------------------------------------------------------
-   Helpers for Auth0 tier syncing
+   Tier helpers for Stripe / Auth0
 -------------------------------------------------------------------*/
-
 /**
  * Try to extract the tier ("starter", "pro", "elite") from the invoice.
  * You can store { "tier": "pro" } as metadata on:
@@ -454,24 +542,19 @@ app.post('/export/docx', (req, res) => {
  */
 function getTierFromInvoice(invoice) {
   const mdInvoice = invoice.metadata || {};
-  const firstLine = invoice.lines && invoice.lines.data && invoice.lines.data[0];
+  const firstLine =
+    invoice.lines && invoice.lines.data && invoice.lines.data[0];
   const mdLine = firstLine?.metadata || {};
   const price = firstLine?.price || {};
   const mdPrice = price.metadata || {};
   const product = price.product || {};
   const mdProduct = product.metadata || {};
 
-  const tier =
-    mdLine.tier ||
-    mdPrice.tier ||
-    mdProduct.tier ||
-    mdInvoice.tier;
-
+  const tier = mdLine.tier || mdPrice.tier || mdProduct.tier || mdInvoice.tier;
   if (!tier) return null;
 
   const normalized = String(tier).toLowerCase();
   if (['starter', 'pro', 'elite'].includes(normalized)) return normalized;
-
   return null;
 }
 
@@ -484,14 +567,13 @@ function getTierFromSubscription(sub) {
   if (!item) return null;
 
   const mdPrice = (item.price && item.price.metadata) || {};
-  const mdPlan  = (item.plan  && item.plan.metadata)  || {};
+  const mdPlan = (item.plan && item.plan.metadata) || {};
 
   const rawTier = mdPrice.tier || mdPlan.tier;
   if (!rawTier) return null;
 
   const normalized = String(rawTier).toLowerCase();
-  if (["starter", "pro", "elite"].includes(normalized)) return normalized;
-
+  if (['starter', 'pro', 'elite'].includes(normalized)) return normalized;
   return null;
 }
 
@@ -503,7 +585,6 @@ async function updateAuth0TierByEmail(email, tier) {
   if (!trimmed || !tier) return;
 
   try {
-    // Lookup the user by email
     const users = await auth0Mgmt.getUsersByEmail(trimmed);
     if (!users || users.length === 0) {
       console.warn('[auth0-sync] No user found for email:', trimmed);
@@ -513,7 +594,6 @@ async function updateAuth0TierByEmail(email, tier) {
     const user = users[0];
     const userId = user.user_id;
 
-    // Update the app_metadata.tier field
     await auth0Mgmt.updateAppMetadata({ id: userId }, { tier });
 
     console.log(`[auth0-sync] Updated tier="${tier}" for userId=${userId}`);
@@ -522,7 +602,17 @@ async function updateAuth0TierByEmail(email, tier) {
   }
 }
 
-// Basic Express server template
+/* ------------------------------------------------------------------
+   Basic health check
+-------------------------------------------------------------------*/
 app.get('/', (req, res) => {
   res.send('Blossom backend is running!');
+});
+
+/* ------------------------------------------------------------------
+   Start server
+-------------------------------------------------------------------*/
+const PORT = process.env.PORT || 4242;
+app.listen(PORT, () => {
+  console.log(`Stripe test server listening on http://localhost:${PORT}`);
 });
