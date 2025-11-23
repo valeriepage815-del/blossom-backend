@@ -1,14 +1,14 @@
 // (Consolidated server - /api endpoints are added below)
 require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const Stripe = require('stripe');
-// (Consolidated server - /api endpoints are added below)
-require('dotenv').config();
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const Stripe = require('stripe');
+const fs = require('fs');
+const path = require('path');
+const { ManagementClient } = require('auth0');
+const multer = require('multer');
+const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { ManagementClient } = require('auth0');
