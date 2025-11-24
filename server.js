@@ -410,7 +410,8 @@ app.get('/debug/auth0-tier', async (req, res) => {
 	}
 
 	try {
-		const users = await auth0Mgmt.getUsersByEmail(email);
+		// NEW STYLE: methods under auth0Mgmt.users
+		const users = await auth0Mgmt.users.getByEmail({ email });
 
 		if (!users || users.length === 0) {
 			return res
@@ -593,7 +594,8 @@ async function updateAuth0TierByEmail(email, tier) {
 	if (!trimmed || !tier) return;
 
 	try {
-		const users = await auth0Mgmt.getUsersByEmail(trimmed);
+		// NEW STYLE: methods under auth0Mgmt.users
+		const users = await auth0Mgmt.users.getByEmail({ email: trimmed });
 
 		if (!users || users.length === 0) {
 			console.warn('[auth0-sync] No user found for email:', trimmed);
@@ -608,7 +610,8 @@ async function updateAuth0TierByEmail(email, tier) {
 			tier,
 		};
 
-		await auth0Mgmt.updateAppMetadata({ id: userId }, newAppMetadata);
+		// NEW STYLE: update via users.update
+		await auth0Mgmt.users.update({ id: userId }, { app_metadata: newAppMetadata });
 
 		console.log(`[auth0-sync] Updated tier="${tier}" for userId=${userId}`);
 	} catch (err) {
