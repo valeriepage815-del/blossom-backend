@@ -38,6 +38,45 @@ app.post(
     const sig = req.headers['stripe-signature'];
     let event;
 
+// (Consolidated server - /api endpoints are added below)
+require('dotenv').config();
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const Stripe = require('stripe');
+const fs = require('fs');
+const path = require('path');
+const { ManagementClient } = require('auth0');
+const multer = require('multer');
+const cors = require('cors');
+
+const app = express();
+
+// ---- Auth0 Management (M2M app) ----
+const auth0Mgmt = new ManagementClient({
+  domain: process.env.AUTH0_DOMAIN,
+  clientId: process.env.AUTH0_M2M_CLIENT_ID,
+  clientSecret: process.env.AUTH0_M2M_CLIENT_SECRET,
+  audience: process.env.AUTH0_MANAGEMENT_API_AUDIENCE,
+  scope: 'read:users update:users_app_metadata',
+});
+
+// ---- Stripe ----
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+// CORS for frontend
+app.use(cors());
+
+/* ------------------------------------------------------------------
+   Stripe Webhook (MUST be before express.json)
+-------------------------------------------------------------------*/
+app.post(
+  '/webhook',
+  bodyParser.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
     try {
       event = stripe.webhooks.constructEvent(
         req.body,
@@ -159,9 +198,8 @@ app.post(
             console.error('Failed to update subscription file', err);
           }
 
-          // 2) NEW: sync Auth0 tier using subscription metadata
+          // 2) Sync Auth0 tier using subscription metadata (price/plan.metadata.tier)
           try {
-            // your helper that reads metadata from sub.items[0].price/plan
             const tier = getTierFromSubscription(sub);
 
             // Try to get an email directly on the subscription…
@@ -173,20 +211,32 @@ app.post(
                 const customer = await stripe.customers.retrieve(sub.customer);
                 email = (customer.email || '').trim();
               } catch (custErr) {
-                console.error('[auth0-sync] Failed to retrieve Stripe customer:', custErr);
+                console.error(
+                  '[auth0-sync] Failed to retrieve Stripe customer:',
+                  custErr
+                );
               }
             }
 
             if (!email) {
-              console.warn('[auth0-sync] (subscription.created) No email found; cannot sync tier.');
+              console.warn(
+                '[auth0-sync] (subscription.created) No email found; cannot sync tier.'
+              );
             } else if (!tier) {
-              console.warn('[auth0-sync] (subscription.created) No tier metadata on subscription items; cannot sync tier.');
+              console.warn(
+                '[auth0-sync] (subscription.created) No tier metadata on subscription items; cannot sync tier.'
+              );
             } else {
-              console.log(`[auth0-sync] (subscription.created) Setting tier="${tier}" for email=${email}`);
+              console.log(
+                `[auth0-sync] (subscription.created) Setting tier="${tier}" for email=${email}`
+              );
               await updateAuth0TierByEmail(email, tier);
             }
           } catch (err) {
-            console.error('[auth0-sync] Error syncing tier on customer.subscription.created:', err);
+            console.error(
+              '[auth0-sync] Error syncing tier on customer.subscription.created:',
+              err
+            );
           }
 
           break;
@@ -241,7 +291,12 @@ app.post('/upload-image', upload.single('image'), (req, res) => {
 
   // persist metadata
   try {
-    const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
+    const metaPath = path.join(
+      __dirname,
+      'public',
+      'uploads',
+      'metadata.json'
+    );
     let meta = [];
     if (fs.existsSync(metaPath)) {
       meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
@@ -262,7 +317,12 @@ app.post('/upload-image', upload.single('image'), (req, res) => {
 // Admin: list uploads
 app.get('/admin/uploads', (req, res) => {
   try {
-    const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
+    const metaPath = path.join(
+      __dirname,
+      'public',
+      'uploads',
+      'metadata.json'
+    );
     if (!fs.existsSync(metaPath)) return res.json([]);
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
     res.json(meta);
@@ -278,7 +338,12 @@ app.delete('/admin/uploads/:filename', (req, res) => {
     const filePath = path.join(__dirname, 'public', 'uploads', filename);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
-    const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
+    const metaPath = path.join(
+      __dirname,
+      'public',
+      'uploads',
+      'metadata.json'
+    );
     let meta = [];
     if (fs.existsSync(metaPath)) {
       meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
@@ -327,7 +392,8 @@ app.post('/create-subscription', async (req, res) => {
       expand: ['latest_invoice.payment_intent'],
     });
 
-    const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
+    const clientSecret =
+      subscription.latest_invoice.payment_intent.client_secret;
 
     // Persist a lightweight subscriptions JSON
     try {
@@ -372,8 +438,7 @@ app.get('/debug/auth0-tier', async (req, res) => {
   }
 
   try {
-    // New SDK style: listUsersByEmail
-    const users = await auth0Mgmt.users.listUsersByEmail({ email });
+    const users = await auth0Mgmt.getUsersByEmail(email);
 
     if (!users || users.length === 0) {
       return res
@@ -583,7 +648,7 @@ function getTierFromInvoice(invoice) {
   if (!tier) return null;
 
   const normalized = String(tier).toLowerCase();
-  if (["starter", "pro", "elite"].includes(normalized)) return normalized;
+  if (['starter', 'pro', 'elite'].includes(normalized)) return normalized;
   return null;
 }
 
@@ -602,7 +667,7 @@ function getTierFromSubscription(sub) {
   if (!rawTier) return null;
 
   const normalized = String(rawTier).toLowerCase();
-  if (["starter", "pro", "elite"].includes(normalized)) return normalized;
+  if (['starter', 'pro', 'elite'].includes(normalized)) return normalized;
   return null;
 }
 
@@ -614,8 +679,7 @@ async function updateAuth0TierByEmail(email, tier) {
   if (!trimmed || !tier) return;
 
   try {
-    // New SDK style: look up by email
-    const users = await auth0Mgmt.users.listUsersByEmail({ email: trimmed });
+    const users = await auth0Mgmt.getUsersByEmail(trimmed);
 
     if (!users || users.length === 0) {
       console.warn('[auth0-sync] No user found for email:', trimmed);
@@ -630,8 +694,7 @@ async function updateAuth0TierByEmail(email, tier) {
       tier,
     };
 
-    // New SDK style: update(id, body)
-    await auth0Mgmt.users.update(userId, { app_metadata: newAppMetadata });
+    await auth0Mgmt.updateAppMetadata({ id: userId }, newAppMetadata);
 
     console.log(`[auth0-sync] Updated tier="${tier}" for userId=${userId}`);
   } catch (err) {
