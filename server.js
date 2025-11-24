@@ -574,8 +574,10 @@ function getTierFromInvoice(invoice) {
   const mdLine = firstLine?.metadata || {};
   const price = firstLine?.price || {};
   const mdPrice = price.metadata || {};
-  const product = price.product || {};
-  const mdProduct = product.metadata || {};
+  let mdProduct = {};
+  if (price.product && typeof price.product === 'object') {
+    mdProduct = price.product.metadata || {};
+  }
 
   const tier = mdLine.tier || mdPrice.tier || mdProduct.tier || mdInvoice.tier;
   if (!tier) return null;
