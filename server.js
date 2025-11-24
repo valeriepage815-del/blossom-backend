@@ -134,7 +134,7 @@ app.post(
           const sub = event.data.object;
           console.log('Subscription created:', sub.id);
 
-          // Create/update entry in subscriptions.json
+          // 1) Keep your existing file-based tracking
           try {
             const outPath = path.join(__dirname, 'public', 'data');
             if (!fs.existsSync(outPath)) {
@@ -143,8 +143,7 @@ app.post(
             const subsFile = path.join(outPath, 'subscriptions.json');
             let subs = {};
             if (fs.existsSync(subsFile)) {
-              subs =
-                JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}') || {};
+              subs = JSON.parse(fs.readFileSync(subsFile, 'utf8') || '{}') || {};
             }
 
             const sid = sub.id;
@@ -158,6 +157,36 @@ app.post(
             fs.writeFileSync(subsFile, JSON.stringify(subs, null, 2));
           } catch (err) {
             console.error('Failed to update subscription file', err);
+          }
+
+          // 2) NEW: sync Auth0 tier using subscription metadata
+          try {
+            // your helper that reads metadata from sub.items[0].price/plan
+            const tier = getTierFromSubscription(sub);
+
+            // Try to get an email directly on the subscription…
+            let email = (sub.customer_email || '').trim();
+
+            // …if not there, fetch the Customer object and use its email
+            if (!email && typeof sub.customer === 'string') {
+              try {
+                const customer = await stripe.customers.retrieve(sub.customer);
+                email = (customer.email || '').trim();
+              } catch (custErr) {
+                console.error('[auth0-sync] Failed to retrieve Stripe customer:', custErr);
+              }
+            }
+
+            if (!email) {
+              console.warn('[auth0-sync] (subscription.created) No email found; cannot sync tier.');
+            } else if (!tier) {
+              console.warn('[auth0-sync] (subscription.created) No tier metadata on subscription items; cannot sync tier.');
+            } else {
+              console.log(`[auth0-sync] (subscription.created) Setting tier="${tier}" for email=${email}`);
+              await updateAuth0TierByEmail(email, tier);
+            }
+          } catch (err) {
+            console.error('[auth0-sync] Error syncing tier on customer.subscription.created:', err);
           }
 
           break;
