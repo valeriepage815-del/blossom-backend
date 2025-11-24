@@ -372,7 +372,9 @@ app.get('/debug/auth0-tier', async (req, res) => {
   }
 
   try {
-    const users = await auth0Mgmt.getUsersByEmail(email);
+    // New SDK style: listUsersByEmail
+    const { data: users } = await auth0Mgmt.users.listUsersByEmail({ email });
+
     if (!users || users.length === 0) {
       return res
         .status(404)
@@ -610,7 +612,11 @@ async function updateAuth0TierByEmail(email, tier) {
   if (!trimmed || !tier) return;
 
   try {
-    const users = await auth0Mgmt.getUsersByEmail(trimmed);
+    // New SDK style: look up by email
+    const { data: users } = await auth0Mgmt.users.listUsersByEmail({
+      email: trimmed,
+    });
+
     if (!users || users.length === 0) {
       console.warn('[auth0-sync] No user found for email:', trimmed);
       return;
@@ -619,7 +625,17 @@ async function updateAuth0TierByEmail(email, tier) {
     const user = users[0];
     const userId = user.user_id;
 
-    await auth0Mgmt.updateAppMetadata({ id: userId }, { tier });
+    // Preserve any existing app_metadata and add/overwrite tier
+    const newAppMetadata = {
+      ...(user.app_metadata || {}),
+      tier,
+    };
+
+    // New SDK style: update user
+    await auth0Mgmt.users.update(
+      { id: userId },
+      { app_metadata: newAppMetadata }
+    );
 
     console.log(`[auth0-sync] Updated tier="${tier}" for userId=${userId}`);
   } catch (err) {
