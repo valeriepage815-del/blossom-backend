@@ -411,16 +411,10 @@ app.get('/debug/auth0-tier', async (req, res) => {
 	}
 
 	try {
-		const raw = await auth0Mgmt.getUsers({
-			q: `email:"${email}"`,
-			search_engine: 'v3',
-		});
+		// Use usersByEmail.getByEmail for Auth0 user lookup
+		const users = await auth0Mgmt.usersByEmail.getByEmail({ email });
 
-		const users = Array.isArray(raw)
-			? raw
-			: (raw && (raw.users || raw.data)) || [];
-
-		console.log('[auth0-debug] getUsers result size:', users.length);
+		console.log('[auth0-debug] getByEmail result size:', users.length);
 
 		if (!users || users.length === 0) {
 			return res
@@ -604,17 +598,10 @@ async function updateAuth0TierByEmail(email, tier) {
 	if (!trimmed || !tier) return;
 
 	try {
-		const raw = await auth0Mgmt.getUsers({
-			q: `email:"${trimmed}"`,
-			search_engine: 'v3',
-		});
+		// Use usersByEmail.getByEmail for Auth0 user lookup
+		const users = await auth0Mgmt.usersByEmail.getByEmail({ email: trimmed });
 
-		// Normalize result shape to an array
-		const users = Array.isArray(raw)
-			? raw
-			: (raw && (raw.users || raw.data)) || [];
-
-		console.log('[auth0-sync] getUsers result size:', users.length);
+		console.log('[auth0-sync] getByEmail result size:', users.length);
 
 		if (!users || users.length === 0) {
 			console.warn('[auth0-sync] No user found for email:', trimmed);
