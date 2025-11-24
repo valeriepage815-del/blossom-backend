@@ -400,6 +400,7 @@ app.post('/create-subscription', async (req, res) => {
 	}
 });
 
+
 /* ------------------------------------------------------------------
 	 Debug: View Auth0 tier for a user by email
 -------------------------------------------------------------------*/
@@ -410,8 +411,16 @@ app.get('/debug/auth0-tier', async (req, res) => {
 	}
 
 	try {
-		// SDK v4.37.0: use auth0Mgmt.usersByEmail.getByEmail
-		const users = await auth0Mgmt.usersByEmail.getByEmail({ email });
+		const raw = await auth0Mgmt.getUsers({
+			q: `email:"${email}"`,
+			search_engine: 'v3',
+		});
+
+		const users = Array.isArray(raw)
+			? raw
+			: (raw && (raw.users || raw.data)) || [];
+
+		console.log('[auth0-debug] getUsers result size:', users.length);
 
 		if (!users || users.length === 0) {
 			return res
@@ -586,6 +595,7 @@ function getTierFromSubscription(sub) {
 	return null;
 }
 
+
 /**
  * Lookup Auth0 user by email, then set app_metadata.tier
  */
@@ -594,8 +604,17 @@ async function updateAuth0TierByEmail(email, tier) {
 	if (!trimmed || !tier) return;
 
 	try {
-		// SDK v4.37.0: use auth0Mgmt.usersByEmail.getByEmail
-		const users = await auth0Mgmt.usersByEmail.getByEmail({ email: trimmed });
+		const raw = await auth0Mgmt.getUsers({
+			q: `email:"${trimmed}"`,
+			search_engine: 'v3',
+		});
+
+		// Normalize result shape to an array
+		const users = Array.isArray(raw)
+			? raw
+			: (raw && (raw.users || raw.data)) || [];
+
+		console.log('[auth0-sync] getUsers result size:', users.length);
 
 		if (!users || users.length === 0) {
 			console.warn('[auth0-sync] No user found for email:', trimmed);
@@ -603,6 +622,14 @@ async function updateAuth0TierByEmail(email, tier) {
 		}
 
 		const user = users[0];
+		if (!user || !user.user_id) {
+			console.warn(
+				'[auth0-sync] First user has no user_id. User object:',
+				JSON.stringify(user)
+			);
+			return;
+		}
+
 		const userId = user.user_id;
 
 		const newAppMetadata = {
@@ -610,8 +637,7 @@ async function updateAuth0TierByEmail(email, tier) {
 			tier,
 		};
 
-		// NEW STYLE: update via users.update
-		await auth0Mgmt.users.update({ id: userId }, { app_metadata: newAppMetadata });
+		await auth0Mgmt.updateAppMetadata({ id: userId }, newAppMetadata);
 
 		console.log(`[auth0-sync] Updated tier="${tier}" for userId=${userId}`);
 	} catch (err) {
