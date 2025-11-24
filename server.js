@@ -411,7 +411,7 @@ app.get('/debug/auth0-tier', async (req, res) => {
 	}
 
 	try {
-		const raw = await auth0Mgmt.users.getByEmail({ email });
+		const raw = await auth0Mgmt.usersByEmail.getByEmail({ email });
 
 		const users = Array.isArray(raw) ? raw
 			: (raw && Array.isArray(raw.data)) ? raw.data
@@ -601,7 +601,7 @@ async function updateAuth0TierByEmail(email, tier) {
 	if (!trimmed || !tier) return;
 
 	try {
-		const raw = await auth0Mgmt.users.getByEmail({ email: trimmed });
+		const raw = await auth0Mgmt.usersByEmail.getByEmail({ email: trimmed });
 
 		// Handle both possible shapes: array OR { data: [...] }
 		const users = Array.isArray(raw) ? raw
