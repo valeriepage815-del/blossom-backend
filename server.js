@@ -411,15 +411,16 @@ app.get('/debug/auth0-tier', async (req, res) => {
 	}
 
 	try {
-		// Use usersByEmail.getByEmail for Auth0 user lookup
-		const users = await auth0Mgmt.usersByEmail.getByEmail({ email });
+		const raw = await auth0Mgmt.users.getByEmail({ email });
 
-		console.log('[auth0-debug] getByEmail result size:', users.length);
+		const users = Array.isArray(raw) ? raw
+			: (raw && Array.isArray(raw.data)) ? raw.data
+			: [];
 
-		if (!users || users.length === 0) {
+		if (!users.length) {
 			return res
 				.status(404)
-				.json({ error: `No Auth0 user found for ${email}` });
+				.json({ error: `No Auth0 user found for ${email}`, raw });
 		}
 
 		const user = users[0];
@@ -429,6 +430,7 @@ app.get('/debug/auth0-tier', async (req, res) => {
 			user_id: user.user_id,
 			app_metadata: user.app_metadata || {},
 			user_metadata: user.user_metadata || {},
+			_rawKeys: Object.keys(raw || {}),
 		});
 	} catch (err) {
 		console.error('Debug Auth0 error:', err);
@@ -590,6 +592,7 @@ function getTierFromSubscription(sub) {
 }
 
 
+
 /**
  * Lookup Auth0 user by email, then set app_metadata.tier
  */
@@ -598,33 +601,35 @@ async function updateAuth0TierByEmail(email, tier) {
 	if (!trimmed || !tier) return;
 
 	try {
-		// Use usersByEmail.getByEmail for Auth0 user lookup
-		const users = await auth0Mgmt.usersByEmail.getByEmail({ email: trimmed });
+		const raw = await auth0Mgmt.users.getByEmail({ email: trimmed });
 
-		console.log('[auth0-sync] getByEmail result size:', users.length);
+		// Handle both possible shapes: array OR { data: [...] }
+		const users = Array.isArray(raw) ? raw
+			: (raw && Array.isArray(raw.data)) ? raw.data
+			: [];
 
-		if (!users || users.length === 0) {
-			console.warn('[auth0-sync] No user found for email:', trimmed);
+		console.log('[auth0-sync] getByEmail raw type:', typeof raw, 'keys:', raw && Object.keys(raw));
+		console.log('[auth0-sync] getByEmail list size:', users.length);
+
+		if (!users.length) {
+			console.warn('[auth0-sync] No user found for email:', trimmed, 'raw result:', raw);
 			return;
 		}
 
 		const user = users[0];
+
 		if (!user || !user.user_id) {
-			console.warn(
-				'[auth0-sync] First user has no user_id. User object:',
-				JSON.stringify(user)
-			);
+			console.warn('[auth0-sync] First user has no user_id. User object:', user);
 			return;
 		}
 
 		const userId = user.user_id;
-
 		const newAppMetadata = {
 			...(user.app_metadata || {}),
 			tier,
 		};
 
-		await auth0Mgmt.updateAppMetadata({ id: userId }, newAppMetadata);
+		await auth0Mgmt.users.update({ id: userId }, { app_metadata: newAppMetadata });
 
 		console.log(`[auth0-sync] Updated tier="${tier}" for userId=${userId}`);
 	} catch (err) {
