@@ -410,8 +410,8 @@ app.get('/debug/auth0-tier', async (req, res) => {
 	}
 
 	try {
-		// NEW STYLE: methods under auth0Mgmt.users
-		const users = await auth0Mgmt.users.getByEmail({ email });
+		// SDK v4.37.0: use auth0Mgmt.usersByEmail.getByEmail
+		const users = await auth0Mgmt.usersByEmail.getByEmail({ email });
 
 		if (!users || users.length === 0) {
 			return res
@@ -594,8 +594,8 @@ async function updateAuth0TierByEmail(email, tier) {
 	if (!trimmed || !tier) return;
 
 	try {
-		// NEW STYLE: methods under auth0Mgmt.users
-		const users = await auth0Mgmt.users.getByEmail({ email: trimmed });
+		// SDK v4.37.0: use auth0Mgmt.usersByEmail.getByEmail
+		const users = await auth0Mgmt.usersByEmail.getByEmail({ email: trimmed });
 
 		if (!users || users.length === 0) {
 			console.warn('[auth0-sync] No user found for email:', trimmed);
