@@ -1,4 +1,6 @@
 
+const { getOrCreateUserAndSetTier } = require("./auth0Sync");
+
 // (Consolidated server - /api endpoints are added below)
 require('dotenv').config();
 
@@ -103,7 +105,30 @@ app.post(
 					break;
 				}
 
-				case 'invoice.payment_failed': {
+								case 'checkout.session.completed': {
+									const session = event.data.object;
+
+									const email = session.customer_details?.email;
+									const subscriptionId = session.subscription;
+									const stripeCustomerId = session.customer;
+
+									if (!email || !subscriptionId) {
+										console.warn("[auth0-sync] Missing email or subscription id");
+										break;
+									}
+
+									await getOrCreateUserAndSetTier({
+										email,
+										tier: "pro",
+										billing: "monthly",
+										stripeCustomerId,
+										subscriptionId,
+									});
+
+									console.log("[auth0-sync] Tier synced for", email);
+									break;
+								}
+								case 'invoice.payment_failed': {
 					const invoice = event.data.object;
 					console.log('Invoice payment failed:', invoice.id);
 
