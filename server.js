@@ -1,4 +1,3 @@
-
 const { getOrCreateUserAndSetTier } = require("./auth0Sync");
 
 // (Consolidated server - /api endpoints are added below)
@@ -105,30 +104,7 @@ app.post(
 					break;
 				}
 
-								case 'checkout.session.completed': {
-									const session = event.data.object;
-
-									const email = session.customer_details?.email;
-									const subscriptionId = session.subscription;
-									const stripeCustomerId = session.customer;
-
-									if (!email || !subscriptionId) {
-										console.warn("[auth0-sync] Missing email or subscription id");
-										break;
-									}
-
-									await getOrCreateUserAndSetTier({
-										email,
-										tier: "pro",
-										billing: "monthly",
-										stripeCustomerId,
-										subscriptionId,
-									});
-
-									console.log("[auth0-sync] Tier synced for", email);
-									break;
-								}
-								case 'invoice.payment_failed': {
+				case 'invoice.payment_failed': {
 					const invoice = event.data.object;
 					console.log('Invoice payment failed:', invoice.id);
 
@@ -425,7 +401,6 @@ app.post('/create-subscription', async (req, res) => {
 	}
 });
 
-
 /* ------------------------------------------------------------------
 	 Debug: View Auth0 tier for a user by email
 -------------------------------------------------------------------*/
@@ -615,8 +590,6 @@ function getTierFromSubscription(sub) {
 	if (['starter', 'pro', 'elite'].includes(normalized)) return normalized;
 	return null;
 }
-
-
 
 /**
  * Lookup Auth0 user by email, then set app_metadata.tier
