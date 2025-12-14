@@ -1,5 +1,3 @@
-const { getOrCreateUserAndSetTier } = require("./auth0Sync");
-
 // (Consolidated server - /api endpoints are added below)
 require('dotenv').config();
 
@@ -81,7 +79,7 @@ app.post(
 					try {
 						const email =
 							invoice.customer_email || invoice.customer_details?.email;
-						const tier = getTierFromInvoice(invoice);
+						const tier = await getTierFromInvoiceAsync(invoice);
 
 						if (!email) {
 							console.warn(
@@ -89,7 +87,7 @@ app.post(
 							);
 						} else if (!tier) {
 							console.warn(
-								'[auth0-sync] No tier metadata on invoice/line/price; cannot sync tier.'
+								'[auth0-sync] No tier metadata on invoice/line/price/product; cannot sync tier.'
 							);
 						} else {
 							console.log(
@@ -160,9 +158,9 @@ app.post(
 						console.error('Failed to update subscription file', err);
 					}
 
-					// 2) Sync Auth0 tier using subscription metadata (price/plan.metadata.tier)
+					// 2) Sync Auth0 tier using subscription metadata (price/product.metadata.tier)
 					try {
-						const tier = getTierFromSubscription(sub);
+						const tier = await getTierFromSubscriptionAsync(sub);
 
 						// Try to get an email directly on the subscription…
 						let email = (sub.customer_email || '').trim();
@@ -252,12 +250,7 @@ app.post('/upload-image', upload.single('image'), (req, res) => {
 
 	// persist metadata
 	try {
-		const metaPath = path.join(
-			__dirname,
-			'public',
-			'uploads',
-			'metadata.json'
-		);
+		const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
 		let meta = [];
 		if (fs.existsSync(metaPath)) {
 			meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
@@ -278,12 +271,7 @@ app.post('/upload-image', upload.single('image'), (req, res) => {
 // Admin: list uploads
 app.get('/admin/uploads', (req, res) => {
 	try {
-		const metaPath = path.join(
-			__dirname,
-			'public',
-			'uploads',
-			'metadata.json'
-		);
+		const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
 		if (!fs.existsSync(metaPath)) return res.json([]);
 		const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
 		res.json(meta);
@@ -299,12 +287,7 @@ app.delete('/admin/uploads/:filename', (req, res) => {
 		const filePath = path.join(__dirname, 'public', 'uploads', filename);
 		if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
-		const metaPath = path.join(
-			__dirname,
-			'public',
-			'uploads',
-			'metadata.json'
-		);
+		const metaPath = path.join(__dirname, 'public', 'uploads', 'metadata.json');
 		let meta = [];
 		if (fs.existsSync(metaPath)) {
 			meta = JSON.parse(fs.readFileSync(metaPath, 'utf8') || '[]');
@@ -413,8 +396,10 @@ app.get('/debug/auth0-tier', async (req, res) => {
 	try {
 		const raw = await auth0Mgmt.usersByEmail.getByEmail({ email });
 
-		const users = Array.isArray(raw) ? raw
-			: (raw && Array.isArray(raw.data)) ? raw.data
+		const users = Array.isArray(raw)
+			? raw
+			: raw && Array.isArray(raw.data)
+			? raw.data
 			: [];
 
 		if (!users.length) {
@@ -552,43 +537,65 @@ app.post('/api/bullets', (req, res) => {
 /* ------------------------------------------------------------------
 	 Tier helpers for Stripe / Auth0
 -------------------------------------------------------------------*/
-function getTierFromInvoice(invoice) {
-	const mdInvoice = invoice.metadata || {};
-	const firstLine =
-		invoice.lines && invoice.lines.data && invoice.lines.data[0];
-	const mdLine = firstLine?.metadata || {};
-	const price = firstLine?.price || {};
-	const mdPrice = price.metadata || {};
-	let mdProduct = {};
-	if (price.product && typeof price.product === 'object') {
-		mdProduct = price.product.metadata || {};
-	}
 
-	const tier = mdLine.tier || mdPrice.tier || mdProduct.tier || mdInvoice.tier;
+function normalizeTier(tier) {
 	if (!tier) return null;
-
-	const normalized = String(tier).toLowerCase();
+	const normalized = String(tier).toLowerCase().trim();
 	if (['starter', 'pro', 'elite'].includes(normalized)) return normalized;
 	return null;
 }
 
-/**
- * Get tier ("starter", "pro", "elite") from a Stripe subscription object.
- * Looks at the first subscription item’s price/plan metadata.
- */
-function getTierFromSubscription(sub) {
-	const item = sub.items && sub.items.data && sub.items.data[0];
+async function getTierFromInvoiceAsync(invoice) {
+	const mdInvoice = invoice.metadata || {};
+	const firstLine = invoice.lines?.data?.[0];
+	const mdLine = firstLine?.metadata || {};
+	const priceObj = firstLine?.price || {};
+	const mdPrice = priceObj.metadata || {};
+
+	// Try product metadata if we can fetch it (invoice line often has price.product as string)
+	let mdProduct = {};
+	try {
+		const productId =
+			typeof priceObj.product === 'string'
+				? priceObj.product
+				: priceObj.product?.id;
+
+		if (productId) {
+			const product = await stripe.products.retrieve(productId);
+			mdProduct = product?.metadata || {};
+		}
+	} catch (e) {
+		// non-fatal
+	}
+
+	return normalizeTier(mdLine.tier || mdPrice.tier || mdProduct.tier || mdInvoice.tier);
+}
+
+async function getTierFromSubscriptionAsync(sub) {
+	const item = sub.items?.data?.[0];
 	if (!item) return null;
 
-	const mdPrice = (item.price && item.price.metadata) || {};
-	const mdPlan = (item.plan && item.plan.metadata) || {};
+	// best case: metadata is present directly
+	const mdPrice = item.price?.metadata || {};
+	const mdPlan = item.plan?.metadata || {};
+	let tier = mdPrice.tier || mdPlan.tier;
 
-	const rawTier = mdPrice.tier || mdPlan.tier;
-	if (!rawTier) return null;
+	// If missing, fetch the price (and product) from Stripe to read metadata
+	if (!tier && item.price?.id) {
+		try {
+			const price = await stripe.prices.retrieve(item.price.id, {
+				expand: ['product'],
+			});
+			const priceMd = price?.metadata || {};
+			const productMd =
+				typeof price.product === 'object' ? (price.product.metadata || {}) : {};
+			tier = priceMd.tier || productMd.tier;
+		} catch (e) {
+			// non-fatal
+		}
+	}
 
-	const normalized = String(rawTier).toLowerCase();
-	if (['starter', 'pro', 'elite'].includes(normalized)) return normalized;
-	return null;
+	return normalizeTier(tier);
 }
 
 /**
@@ -596,27 +603,26 @@ function getTierFromSubscription(sub) {
  */
 async function updateAuth0TierByEmail(email, tier) {
 	const trimmed = (email || '').trim();
-	if (!trimmed || !tier) return;
+	const normalizedTier = normalizeTier(tier);
+	if (!trimmed || !normalizedTier) return;
 
 	try {
 		const raw = await auth0Mgmt.usersByEmail.getByEmail({ email: trimmed });
 
 		// Handle both possible shapes: array OR { data: [...] }
-		const users = Array.isArray(raw) ? raw
-			: (raw && Array.isArray(raw.data)) ? raw.data
+		const users = Array.isArray(raw)
+			? raw
+			: raw && Array.isArray(raw.data)
+			? raw.data
 			: [];
 
-		console.log('[auth0-sync] getByEmail raw type:', typeof raw, 'keys:', raw && Object.keys(raw));
-		console.log('[auth0-sync] getByEmail list size:', users.length);
-
 		if (!users.length) {
-			console.warn('[auth0-sync] No user found for email:', trimmed, 'raw result:', raw);
+			console.warn('[auth0-sync] No user found for email:', trimmed);
 			return;
 		}
 
 		const user = users[0];
-
-		if (!user || !user.user_id) {
+		if (!user?.user_id) {
 			console.warn('[auth0-sync] First user has no user_id. User object:', user);
 			return;
 		}
@@ -624,12 +630,16 @@ async function updateAuth0TierByEmail(email, tier) {
 		const userId = user.user_id;
 		const newAppMetadata = {
 			...(user.app_metadata || {}),
-			tier,
+			tier: normalizedTier,
+			updatedAt: new Date().toISOString(),
 		};
 
-		await auth0Mgmt.users.update({ id: userId }, { app_metadata: newAppMetadata });
+		await auth0Mgmt.users.update(
+			{ id: userId },
+			{ app_metadata: newAppMetadata }
+		);
 
-		console.log(`[auth0-sync] Updated tier="${tier}" for userId=${userId}`);
+		console.log(`[auth0-sync] Updated tier="${normalizedTier}" for userId=${userId}`);
 	} catch (err) {
 		console.error('Error updating Auth0 tier:', err);
 	}
