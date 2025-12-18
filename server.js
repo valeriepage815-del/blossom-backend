@@ -27,6 +27,37 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 // CORS for frontend
 app.use(cors());
 
+// Salary Simulator data file
+const salarySimulatorPath = path.join(__dirname, 'data', 'salary-simulator.json');
+
+// GET /api/salary-simulator (load)
+app.get('/api/salary-simulator', (req, res) => {
+	try {
+		if (fs.existsSync(salarySimulatorPath)) {
+			const data = JSON.parse(fs.readFileSync(salarySimulatorPath, 'utf8'));
+			return res.json(data);
+		} else {
+			// Default response if no file exists
+			return res.json({ salaries: [], lastUpdated: null });
+		}
+	} catch (err) {
+		console.error('GET /api/salary-simulator error', err);
+		return res.status(500).json({ error: 'server_error' });
+	}
+});
+
+// POST /api/salary-simulator (save)
+app.use(express.json());
+app.post('/api/salary-simulator', (req, res) => {
+	try {
+		const data = req.body;
+		fs.writeFileSync(salarySimulatorPath, JSON.stringify(data, null, 2));
+		return res.json({ success: true });
+	} catch (err) {
+		console.error('POST /api/salary-simulator error', err);
+		return res.status(500).json({ error: 'server_error' });
+	}
+});
 /* ------------------------------------------------------------------
 	 Stripe Webhook (MUST be before express.json)
 -------------------------------------------------------------------*/
@@ -216,7 +247,6 @@ app.post(
 
 /* ------------------------------------------------------------------
 	 All other middleware/routes AFTER webhook
--------------------------------------------------------------------*/
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
